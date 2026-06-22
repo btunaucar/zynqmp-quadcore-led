@@ -29,6 +29,7 @@ Ping!
 Pong!
 ...
 ```
+![Demo](demo.gif)
 
 ## Hardware
 
