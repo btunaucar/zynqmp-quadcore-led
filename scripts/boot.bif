@@ -1,0 +1,16 @@
+// arch = zynqmp; split = false; format = BIN
+//
+// Boot Image Format file used by bootgen to assemble BOOT.bin for standalone
+// QSPI boot. Adjust the paths below to your actual Vitis build output before
+// running bootgen. This is the real partition layout used on hardware:
+// FSBL -> PMU firmware -> PL bitstream -> one ELF per core (A53-0, A53-1, R5-0, R5-1).
+the_ROM_image:
+{
+	[bootloader, destination_cpu = a53-0] led_platform/export/led_platform/sw/boot/fsbl.elf
+	[destination_cpu = pmu] pmufw/app/build/pmufw.elf
+	[destination_device = pl] vivado/zynq_led_v2.runs/impl_1/design_1_wrapper.bit
+	[destination_cpu = a53-0] vitis/core0_a53_1hz/build/core0_a53_1hz.elf
+	[destination_cpu = a53-1] vitis/core1_a53_2hz/build/core1_a53_2hz.elf
+	[destination_cpu = r5-0]  vitis/core2_r5_4hz/build/core2_r5_4hz.elf
+	[destination_cpu = r5-1]  vitis/core3_r5_8hz/build/core3_r5_8hz.elf
+}
