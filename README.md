@@ -1,135 +1,245 @@
-# ZynqMP Dual-Core Ping-Pong
+# ZynqMP Quad-Core Synchronized LED Blinker
 
-> Developed during an internship at InfoDif (Summer 2026) as a foundational project for getting acquainted with the ALINX AXU2CGB developer board — building the intuition needed for more advanced multi-core and FPGA-accelerated applications on the Zynq UltraScale+ platform.
+> Successor to this repo's original dual-core UART ping-pong project, built on the
+> same ALINX AXU2CGB board. Where ping-pong used 2 Cortex-A53 cores exchanging
+> messages over UART via JTAG, this project drives all 4 heterogeneous PS cores
+> at once — 2× Cortex-A53 (APU) + 2× Cortex-R5 (RPU) — each blinking its own LED
+> at a different frequency, synchronized at startup, and booting completely
+> standalone from QSPI flash with no JTAG cable, debugger, or host PC involved.
 
-A bare-metal dual-core demonstration on the **ALINX AXU2CGB** development board (Zynq UltraScale+ MPSoC ZU2CG), running two Cortex-A53 cores simultaneously with shared memory synchronization — without an RTOS or BSP.
+A bare-metal, 4-core demonstration on the **ALINX AXU2CGB** development board
+(Zynq UltraScale+ MPSoC ZU2CG), where every processor core available on the PS —
+both A53 application cores and both R5 real-time cores — runs independent
+bare-metal code simultaneously, with no RTOS and no shared BSP between them.
 
 ## Overview
 
-This project demonstrates multi-core bare-metal programming on the ZynqMP PS (Processing System). Two A53 cores exchange "Ping!" and "Pong!" messages over UART using a shared memory flag at a fixed DDR address, taking turns in strict sequence.
+Each of the 4 cores owns one LED on the board's J15 header and blinks it at its
+own fixed frequency (1 Hz, 2 Hz, 4 Hz, 8 Hz). The interesting part isn't the
+blinking itself — it's getting 4 independently-linked bare-metal programs,
+running on two different processor architectures (ARMv8-A and ARMv7-R), to
+start blinking in lockstep every single time the board powers on or resets,
+without any of them being "primary" or coordinating through software running
+on another core.
 
-The goal was to build hands-on intuition for the Zynq UltraScale+ platform — understanding how the PS works, how cores communicate through shared DDR, and how to load and run bare-metal code alongside a running Linux system via JTAG. These concepts form the foundation for more advanced work such as FPGA-accelerated signal processing pipelines and heterogeneous multi-core applications.
+That's done with a small shared-memory barrier in DDR: every core increments
+a shared generation counter, publishes its own arrival in a per-core slot, then
+spins until it sees all 4 slots agree — only then does it start toggling its
+LED. Because A53 and R5 both cache DDR locally, every read/write to the barrier
+is wrapped in explicit cache maintenance so the cores actually see each other's
+writes instead of stale cached values.
 
-```
-Core 0 (A53 #0)          Shared Memory           Core 1 (A53 #1)
-     │                   0x50000000                    │
-     │── writes "Ping!" ──────────────────────────────>│
-     │── sets flag = 1 ──────────────────────────────> │
-     │                                                  │── writes "Pong!"
-     │                                                  │── sets flag = 0
-     │<─────────────────────────────────────────────────│
-     └──────────────────── repeat ─────────────────────┘
-```
-
-**UART output (115200 baud):**
-
-![Demo](demo.gif)
+The other half of the project was making the whole thing boot completely on
+its own — no JTAG cable plugged in, no debugger attached, no host PC. See
+[Key Technical Notes](#key-technical-notes) for the FSBL bug that was blocking
+exactly that.
 
 ## Hardware
 
-- **Board:** ALINX AXU2CGB-I
-- **SoC:** Zynq UltraScale+ MPSoC ZU2CG (xczu2cg-sfvc784-1-i)
-- **JTAG:** Digilent JTAG-HS1
-- **Boot mode:** SD card (PetaLinux 2020.1)
+- **Board:** ALINX AXU2CGB
+- **SoC:** Zynq UltraScale+ MPSoC ZU2CG (`xczu2cg-sfvc784-1-e`)
+- **Cores used:** all 4 — 2× Cortex-A53 (APU, `psu_cortexa53_0` / `_1`) + 2× Cortex-R5 (RPU, split mode, `psu_cortexr5_0` / `_1`)
+- **LEDs:** 4× LED on the J15 header, driven from PS GPIO through EMIO (no PL logic besides the EMIO passthrough — the block design is a single Zynq UltraScale+ PS IP with a 4-bit `GPIO_0_0` EMIO interface)
+- **Boot mode:** QSPI, fully standalone (no SD card, no JTAG required after flashing)
+
+| Core | Domain | GPIO pin (EMIO) | `GPIO_0_0_tri_io` bit | Package pin | Blink rate |
+|------|--------|:---:|:---:|:---:|:---:|
+| A53-0 | `standalone_psu_cortexa53_0` | 78 | `[0]` | AG11 | 1 Hz |
+| A53-1 | `standalone_psu_cortexa53_1` | 79 | `[1]` | AB14 | 2 Hz |
+| R5-0  | `standalone_psu_cortexr5_0`  | 80 | `[2]` | W13  | 4 Hz |
+| R5-1  | `standalone_psu_cortexr5_1`  | 81 | `[3]` | W11  | 8 Hz |
+
+All 4 pins are `LVCMOS33`. PS GPIO pin numbers 78-81 are EMIO bits 0-3 — ZynqMP PS GPIO has 78 MIO-routed pins (0-77), so pin 78 is the first EMIO bit.
 
 ## How It Works
 
-The key insight of this project is using **Linux as a DDR initializer**. The board boots PetaLinux from SD card, which initializes DDR4 (2GB). After Linux is fully booted, XSCT loads bare-metal ELF files onto individual A53 cores via JTAG — bypassing FSBL entirely.
+### Boot chain
 
-This avoids a known issue in Vitis 2025: FSBL compiled with GCC 13 + LTO produces DWARF debug info that XSDB cannot parse, causing `XFsbl_Exit` breakpoint failures and preventing ELF download.
+`BOOT.bin` (built via `bootgen` from `scripts/boot.bif`) contains, in order:
+FSBL (runs on A53-0) → PMU firmware → PL bitstream → one ELF per core. FSBL
+brings up DDR and the PS, configures the PL, then releases all 4 cores out of
+reset with their respective ELF already loaded — each core starts executing
+its own `main()` independently, with no core waiting on another to hand off
+control.
+
+### Startup barrier (generation-counter sync)
+
+A 5-word `uint32_t` region at a fixed DDR address (`0x10000000`) is used purely
+as a rendezvous point:
+
+```c
+sync[0..3]  // one slot per core — "I have reached the barrier for generation N"
+sync[4]     // the current generation counter
+```
+
+Each core reads the current generation, computes `gen = sync[4] + 1`, writes
+`gen` into its own slot, then busy-waits until all 4 slots read back `gen`.
+The core that observes the last slot flip writes `gen` into `sync[4]`, which
+lets every core proceed. Because this is a race-free monotonically increasing
+counter rather than a boolean flag, the barrier also works correctly across
+repeated power cycles — there's no stale "already triggered" state to reset.
+
+Every access to the barrier region is bracketed with `Xil_DCacheFlushRange` /
+`Xil_DCacheInvalidateRange`, since both the A53 and R5 domains run with their
+D-caches enabled and DDR is not otherwise coherent between the APU and RPU.
+
+### After the barrier
+
+Once released, each core just does its own thing — there is no further
+inter-core communication, no round-robin, no shared state. Each core writes
+its GPIO pin high, sleeps half its blink period, writes it low, sleeps again,
+forever.
 
 ### Memory Map
 
-| Region | Address | Purpose |
-|--------|---------|---------|
-| Core 0 ELF | `0x10000000` | Core 0 code + data |
-| Core 1 ELF | `0x20000000` | Core 1 code + data |
-| Shared flag | `0x50000000` | Inter-core synchronization |
-| UART0 TX | `0xFF000030` | Serial output |
-| UART0 Status | `0xFF00002C` | TX FIFO status |
+| Address | Region | Purpose |
+|---|---|---|
+| `0x10000000` | DDR (shared) | Sync barrier — 5× `uint32_t`: `[0..3]` = per-core generation slots, `[4]` = global generation counter |
+| `0x00000000` – `0x7FF00000` | DDR | A53-0 code/data/stack (`psu_ddr_0_memory_0`, `led1.c`'s linker script) |
+| `0x20000000` – `0x3FF00000` | DDR | A53-1 code/data/stack (`psu_ddr_0_memory_0`, offset in `led2.c`'s linker script to stay clear of A53-0) |
+| `0x00000000` – `0x0003FFFF` | R5 TCM (ATCM/BTCM) | R5 code/data/stack (`psu_r5_tcm_ram_0_MEM_0`, 256 KB per core, private per-core TCM instance) — R5 apps run entirely out of TCM, not DDR |
+| `0xFFFC0000` – `0xFFFFFFFF` | OCM | Reserved by the platform, unused by the application |
+| PS GPIO pin 78-81 (EMIO) | J15 header | LED0-LED3 output pins, see [Hardware](#hardware) table |
+
+The R5 barrier code dereferences `0x10000000` directly — DDR is a single
+physical resource shared by every master in the system (APU and RPU alike),
+so the same address is valid from all 4 cores despite R5's own code and stack
+living in TCM rather than DDR. Both R5 domains' linker scripts also declare an
+identical `psu_r5_ddr_0_memory_0` DDR window (`ORIGIN = 0x100000`), but neither
+app places any section there — TCM holds everything.
 
 ## Tools
 
 - Vivado 2025.2.1
 - Vitis Unified IDE 2025.2.1
-- XSCT (Xilinx Software Command-line Tool)
-- PuTTY (115200 baud, 8N1)
+- CMake + Ninja (Vitis 2025's default embeddedsw build system)
+- `bootgen` (QSPI `BOOT.bin` assembly)
 
 ## Project Structure
 
 ```
-zynqmp-dualcore-pingpong/
+zynqmp-quadcore-led/
 ├── vivado/
-│   ├── export_project.tcl   # Recreate Vivado project from scratch
-│   ├── system.bd            # Block design (Zynq PS + AXI GPIO)
-│   └── led_pins.xdc         # Pin constraints
+│   ├── export_project.tcl   # Recreate the Vivado project from scratch
+│   ├── system.bd            # Block design (Zynq UltraScale+ PS, EMIO GPIO x4)
+│   └── led_pins.xdc         # J15 LED pin constraints
 ├── vitis/
-│   ├── core0_ping/
-│   │   ├── core0_ping.c     # Core 0 source
-│   │   └── lscript.ld       # Linker script (origin: 0x10000000)
-│   └── core1_pong/
-│       ├── core1_pong.c     # Core 1 source
-│       └── lscript.ld       # Linker script (origin: 0x20000000)
+│   ├── core0_a53_1hz/       # A53-0 — psu_cortexa53_0, 1 Hz
+│   │   ├── led1.c
+│   │   └── lscript.ld
+│   ├── core1_a53_2hz/       # A53-1 — psu_cortexa53_1, 2 Hz
+│   │   ├── led2.c
+│   │   └── lscript.ld
+│   ├── core2_r5_4hz/        # R5-0  — psu_cortexr5_0, 4 Hz
+│   │   ├── led3.c
+│   │   └── lscript.ld
+│   └── core3_r5_8hz/        # R5-1  — psu_cortexr5_1, 8 Hz
+│       ├── led4.c
+│       └── lscript.ld
 └── scripts/
-    └── run.tcl              # XSCT automation script
+    └── boot.bif             # bootgen partition layout for standalone QSPI boot
 ```
 
 ## Build & Run
 
-### 1. Recreate Vivado Project
+### 1. Recreate the Vivado Project
 
 ```tcl
 # In Vivado Tcl Console:
 source vivado/export_project.tcl
 ```
 
-Then run Synthesis → Implementation → Generate Bitstream. Export hardware as `system_wrapper.xsa`.
+Then run Synthesis → Implementation → Generate Bitstream, and export hardware
+**with the bitstream included** as `zynq_led_qspi.xsa`.
 
-### 2. Create Vitis Platform
+### 2. Create the Vitis Platform
 
-Open Vitis 2025, create a new Platform Component from `system_wrapper.xsa`:
-- OS: `standalone`
-- Processor: `psu_cortexa53_0`
+Create a new Platform Component from `zynq_led_qspi.xsa` in Vitis 2025 with
+4 `standalone` domains, one per processor:
+
+- `standalone_psu_cortexa53_0`
+- `standalone_psu_cortexa53_1`
+- `standalone_psu_cortexr5_0`
+- `standalone_psu_cortexr5_1`
 
 Build the platform.
 
-### 3. Create Application Components
+### 3. Create the 4 Application Components
 
-Create two Application Components in Vitis:
-- `core0_ping` — copy `vitis/core0_ping/core0_ping.c` and `lscript.ld`
-- `core1_pong` — copy `vitis/core1_pong/core1_pong.c` and `lscript.ld`
+For each of `core0_a53_1hz`, `core1_a53_2hz`, `core2_r5_4hz`, `core3_r5_8hz`,
+create an Application Component targeting the matching domain above, then copy
+in that folder's `.c` file and `lscript.ld`. Build all four; ELFs land at
+`<component>/build/<component>.elf`.
 
-Build both. ELF files will be at:
-- `core0_ping/build/core0_ping.elf`
-- `core1_pong/build/core1_pong.elf`
+### 4. Assemble and Flash BOOT.bin
 
-### 4. Boot Linux on Board
-
-Set boot mode to SD card, power on. Wait for PetaLinux to fully boot (login prompt in PuTTY).
-
-### 5. Run via XSCT
+Update the paths in `scripts/boot.bif` to point at your actual build outputs
+(FSBL, PMU firmware, bitstream, and the 4 application ELFs), then:
 
 ```
-xsct scripts/run.tcl
+bootgen -image scripts/boot.bif -arch zynqmp -o BOOT.bin -w
 ```
 
-Update ELF paths in `run.tcl` to match your build output directory. Open PuTTY (COM port, 115200 baud) to see the output.
+Program `BOOT.bin` to QSPI (Vitis' `program_flash` or Vivado Hardware Manager),
+set the board's boot-mode switch to QSPI, and power-cycle. All 4 LEDs should
+start blinking together, at 1/2/4/8 Hz, with no host connection required.
 
 ## Key Technical Notes
 
-### Vitis 2025 Migration from 2020
+### The generation-counter barrier, not a boolean flag
 
-Migrating from Vitis 2020.1 to 2025.2.1 required resolving a critical FSBL debugging issue. The new GCC 13 toolchain compiles FSBL with `-flto` (Link Time Optimization), which corrupts DWARF debug sections. XSDB cannot read the `XFsbl_Exit` symbol, causing a 60-second timeout and failed ELF download.
+An earlier version of this synchronization used a plain "everyone set, go"
+boolean flag. That breaks on the second and later power cycles: a flag that's
+already `1` from a previous run gives every core a false "go" signal before
+its peers have even reached the barrier. Using a strictly-increasing
+generation counter instead means each boot/reset cycle has its own unique
+target value, so there is no stale state to accidentally satisfy the barrier.
 
-**Workaround:** Boot PetaLinux (which initializes DDR), then load bare-metal ELFs directly onto A53 cores via XSCT after Linux is up.
+### Offset DDR regions for the two A53 cores
 
-### Linker Script Separation
+A53-0 and A53-1 both run out of DDR, and — unlike the two R5 cores, which each
+get a physically separate TCM — DDR is one shared resource. A53-1's linker
+script moves its whole `psu_ddr_0_memory_0` region to `ORIGIN = 0x20000000`
+instead of the default `0x0`, so its code, data, and stack can't land on top
+of A53-0's. This is the same technique this repo's original ping-pong project
+used to keep its two cores' ELFs apart in DDR, just with different offsets.
 
-Both cores share the same physical DDR but must occupy different address ranges to avoid overwriting each other. Core 0 starts at `0x10000000`, Core 1 at `0x20000000`. The shared flag at `0x50000000` sits in a neutral region neither core owns.
+### Root cause of the JTAG dependency (and the fix)
 
-### Shared Memory Synchronization
+The project would only boot when a JTAG cable was attached — powering the
+board with JTAG disconnected hung during FSBL, before any core ever reached
+main(). The cause: the FSBL BSP's `standalone_stdout` (and `stdin`) defaulted
+to `psu_coresight_0` — CoreSight DCC, a channel that only drains when a
+JTAG-attached debugger is actively reading it. `XCoresightPs_DccSendByte()`
+polls the DCC TX-empty bit with no timeout, so the very first FSBL banner
+character sent without a debugger attached spun forever, and the board never
+got past FSBL.
 
-A single `volatile unsigned int` at `0x50000000` acts as a mutex-free turn indicator. `volatile` prevents the compiler from caching the flag in a register — without it, each core would loop forever on a stale cached value.
+**Fix:** rebuild the FSBL BSP with `standalone_stdout:None` and
+`standalone_stdin:None` instead of the coresight default, `ninja install` so
+the resulting libraries actually land in the BSP's `lib/` folder, then delete
+and relink `fsbl.elf` against the updated BSP. Verified with
+`objdump -d fsbl.elf | grep dbgdtrtx` returning empty — no DCC instructions
+left in the binary. With JTAG never in the loop, standalone QSPI boot works
+identically whether or not a debugger is physically connected.
+
+### Real hardware PMU firmware
+
+The final `BOOT.bin` uses a PMU firmware build validated against real
+hardware, rather than the QEMU-target PMUFW image Vitis produces by default
+during platform bring-up — the two are not interchangeable for actual board
+boot.
+
+### Split-mode R5 with TCM-resident code
+
+Both R5 cores run in split mode (independent, not lockstep), and each app's
+linker script places all sections in that core's own TCM
+(`psu_r5_tcm_ram_0_MEM_0`, `ORIGIN = 0x0`, `LENGTH = 0x40000`) rather than
+DDR. The R5 domains also see a DDR window in their linker script
+(`psu_r5_ddr_0_memory_0`, `ORIGIN = 0x100000`) that this application doesn't
+use for code, but the barrier's raw pointer dereference at `0x10000000` still
+resolves to the same physical DDR that the A53 cores use, since DDR sits on
+a shared physical address map visible to every bus master in the system.
 
 ## License
 
