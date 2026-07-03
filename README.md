@@ -1,11 +1,9 @@
 # ZynqMP Quad-Core Synchronized LED Blinker
 
-> Successor to this repo's original dual-core UART ping-pong project, built on the
-> same ALINX AXU2CGB board. Where ping-pong used 2 Cortex-A53 cores exchanging
-> messages over UART via JTAG, this project drives all 4 heterogeneous PS cores
-> at once — 2× Cortex-A53 (APU) + 2× Cortex-R5 (RPU) — each blinking its own LED
-> at a different frequency, synchronized at startup, and booting completely
-> standalone from QSPI flash with no JTAG cable, debugger, or host PC involved.
+> Developed during an internship at InfoDif (Summer 2026) as a foundational
+> project on the ALINX AXU2CGB board — building the multi-core, heterogeneous-
+> processor (Cortex-A53 + Cortex-R5), and standalone-boot intuition needed for
+> larger Zynq UltraScale+ work ahead.
 
 A bare-metal, 4-core demonstration on the **ALINX AXU2CGB** development board
 (Zynq UltraScale+ MPSoC ZU2CG), where every processor core available on the PS —
@@ -124,6 +122,7 @@ zynqmp-quadcore-led/
 │   ├── system.bd            # Block design (Zynq UltraScale+ PS, EMIO GPIO x4)
 │   └── led_pins.xdc         # J15 LED pin constraints
 ├── vitis/
+│   ├── fsbl_bsp.yaml        # FSBL BSP config, stdout/stdin already set to None (see Build & Run)
 │   ├── core0_a53_1hz/       # A53-0 — psu_cortexa53_0, 1 Hz
 │   │   ├── led1.c
 │   │   └── lscript.ld
@@ -169,19 +168,19 @@ boot with a JTAG debugger attached.
 
 #### Required: disable the FSBL's DCC stdout
 
-By default the FSBL's Board Support Package sends its console output over
-CoreSight DCC, a channel that only drains when a debugger is attached — with
-no debugger, FSBL hangs forever on its own startup banner. Fix it before
-building:
+By default, Xilinx's stock FSBL template sends its console output over
+CoreSight DCC — a channel that only drains when a JTAG debugger is attached.
+Build it with the defaults and the board hangs on the FSBL startup banner the
+moment no debugger is connected.
 
-1. In the platform, right-click the `zynqmp_fsbl` domain → **Board Support
-   Package Settings**.
-2. Under the `standalone` driver settings, set both `stdin` and `stdout`
-   from `psu_coresight_0` to **`None`**.
-3. Regenerate the BSP, then build the `zynqmp_fsbl` domain (this produces
-   `fsbl.elf`).
-4. Optional sanity check: `objdump -d fsbl.elf | grep dbgdtrtx` should print
-   nothing — no DCC calls left in the binary.
+This repo already includes the fix: `vitis/fsbl_bsp.yaml` has `stdout` and
+`stdin` set to `None` instead of the CoreSight default. Before building the
+`zynqmp_fsbl` domain, copy this file over the auto-generated `bsp.yaml` in
+that domain's folder, then regenerate the BSP and build — no manual clicking
+through BSP Settings required.
+
+Optional sanity check after building: `objdump -d fsbl.elf | grep dbgdtrtx`
+should print nothing — no DCC calls left in the binary.
 
 Then build the rest of the platform.
 
@@ -236,8 +235,7 @@ A53-0 and A53-1 both run out of DDR, and — unlike the two R5 cores, which each
 get a physically separate TCM — DDR is one shared resource. A53-1's linker
 script moves its whole `psu_ddr_0_memory_0` region to `ORIGIN = 0x20000000`
 instead of the default `0x0`, so its code, data, and stack can't land on top
-of A53-0's. This is the same technique this repo's original ping-pong project
-used to keep its two cores' ELFs apart in DDR, just with different offsets.
+of A53-0's.
 
 ### Root cause of the JTAG dependency (and the fix)
 
@@ -250,10 +248,12 @@ polls the DCC TX-empty bit with no timeout, so the very first FSBL banner
 character sent without a debugger attached spun forever, and the board never
 got past FSBL.
 
-**Fix:** rebuild the FSBL BSP with `standalone_stdout:None` and
-`standalone_stdin:None` instead of the coresight default, `ninja install` so
-the resulting libraries actually land in the BSP's `lib/` folder, then delete
-and relink `fsbl.elf` against the updated BSP. Verified with
+**Fix:** the FSBL BSP needs `standalone_stdout:None` and `standalone_stdin:None`
+instead of the coresight default. That's a config value, not source code — it
+lives in the domain's `bsp.yaml`, so it doesn't have to be a manual, repeated
+step. `vitis/fsbl_bsp.yaml` in this repo already has it applied; drop it in
+before generating the BSP (see [Build & Run](#build--run)) and every rebuild
+of `fsbl.elf` comes out fixed automatically. Verified with
 `objdump -d fsbl.elf | grep dbgdtrtx` returning empty — no DCC instructions
 left in the binary. With JTAG never in the loop, standalone QSPI boot works
 identically whether or not a debugger is physically connected.
