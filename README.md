@@ -162,19 +162,50 @@ Create a new Platform Component from `zynq_led_qspi.xsa` in Vitis 2025 with
 - `standalone_psu_cortexr5_0`
 - `standalone_psu_cortexr5_1`
 
-Build the platform.
+Creating the platform also auto-adds a `zynqmp_fsbl` boot domain — this is
+Xilinx's own stock FSBL template, nobody writes source for it, you just build it.
+**Before** you build that domain, apply the fix below, or the board will only
+boot with a JTAG debugger attached.
 
-### 3. Create the 4 Application Components
+#### Required: disable the FSBL's DCC stdout
+
+By default the FSBL's Board Support Package sends its console output over
+CoreSight DCC, a channel that only drains when a debugger is attached — with
+no debugger, FSBL hangs forever on its own startup banner. Fix it before
+building:
+
+1. In the platform, right-click the `zynqmp_fsbl` domain → **Board Support
+   Package Settings**.
+2. Under the `standalone` driver settings, set both `stdin` and `stdout`
+   from `psu_coresight_0` to **`None`**.
+3. Regenerate the BSP, then build the `zynqmp_fsbl` domain (this produces
+   `fsbl.elf`).
+4. Optional sanity check: `objdump -d fsbl.elf | grep dbgdtrtx` should print
+   nothing — no DCC calls left in the binary.
+
+Then build the rest of the platform.
+
+### 3. Create the PMU Firmware Application
+
+The PMU firmware is also a stock Xilinx template, not custom code: **File →
+New → Application Component**, target processor `psu_pmu_0`, template
+`pmu_firmware`. Build it as-is — this produces `pmufw.elf`. (The platform's
+own default/QEMU-targeted PMU firmware is not sufficient for real hardware,
+which is why this needs to be a proper application component of its own.)
+
+### 4. Create the 4 Application Components
 
 For each of `core0_a53_1hz`, `core1_a53_2hz`, `core2_r5_4hz`, `core3_r5_8hz`,
 create an Application Component targeting the matching domain above, then copy
-in that folder's `.c` file and `lscript.ld`. Build all four; ELFs land at
-`<component>/build/<component>.elf`.
+in that folder's `.c` file and `lscript.ld` — these are the only files in this
+repo you actually need to bring in; everything else above is stock Xilinx
+tooling. Build all four; ELFs land at `<component>/build/<component>.elf`.
 
-### 4. Assemble and Flash BOOT.bin
+### 5. Assemble and Flash BOOT.bin
 
 Update the paths in `scripts/boot.bif` to point at your actual build outputs
-(FSBL, PMU firmware, bitstream, and the 4 application ELFs), then:
+(`fsbl.elf` from step 2, `pmufw.elf` from step 3, the bitstream from step 1,
+and the 4 application ELFs from step 4), then:
 
 ```
 bootgen -image scripts/boot.bif -arch zynqmp -o BOOT.bin -w
@@ -183,6 +214,10 @@ bootgen -image scripts/boot.bif -arch zynqmp -o BOOT.bin -w
 Program `BOOT.bin` to QSPI (Vitis' `program_flash` or Vivado Hardware Manager),
 set the board's boot-mode switch to QSPI, and power-cycle. All 4 LEDs should
 start blinking together, at 1/2/4/8 Hz, with no host connection required.
+
+None of the 5 steps above require writing any new code — steps 1-3 are
+stock Vivado/Vitis tooling and templates, and steps 4-5 only need the files
+already sitting in this repo.
 
 ## Key Technical Notes
 
