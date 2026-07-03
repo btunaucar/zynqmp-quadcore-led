@@ -118,7 +118,7 @@ app places any section there — TCM holds everything.
 ## Project Structure
 
 ```
-zynqmp-dualcore-pingpong/
+zynqmp-quadcore-led/
 ├── vivado/
 │   ├── export_project.tcl   # Recreate the Vivado project from scratch
 │   ├── system.bd            # Block design (Zynq UltraScale+ PS, EMIO GPIO x4)
