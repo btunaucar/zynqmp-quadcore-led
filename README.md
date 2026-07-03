@@ -94,16 +94,19 @@ forever.
 
 | Address | Region | Purpose |
 |---|---|---|
-| `0x10000000` | DDR (shared, A53 view) | Sync barrier — 5× `uint32_t`: `[0..3]` = per-core generation slots, `[4]` = global generation counter |
-| `0x00000000` – `0x7FF00000` | DDR | A53 code/data/stack (`psu_ddr_0_memory_0`, per-core linker script) |
-| `0x00000000` – `0x0003FFFF` | R5 TCM (ATCM/BTCM) | R5 code/data/stack (`psu_r5_tcm_ram_0_MEM_0`, 256 KB per core) — R5 apps run entirely out of TCM, not DDR |
+| `0x10000000` | DDR (shared) | Sync barrier — 5× `uint32_t`: `[0..3]` = per-core generation slots, `[4]` = global generation counter |
+| `0x00000000` – `0x7FF00000` | DDR | A53-0 code/data/stack (`psu_ddr_0_memory_0`, `led1.c`'s linker script) |
+| `0x20000000` – `0x3FF00000` | DDR | A53-1 code/data/stack (`psu_ddr_0_memory_0`, offset in `led2.c`'s linker script to stay clear of A53-0) |
+| `0x00000000` – `0x0003FFFF` | R5 TCM (ATCM/BTCM) | R5 code/data/stack (`psu_r5_tcm_ram_0_MEM_0`, 256 KB per core, private per-core TCM instance) — R5 apps run entirely out of TCM, not DDR |
 | `0xFFFC0000` – `0xFFFFFFFF` | OCM | Reserved by the platform, unused by the application |
 | PS GPIO pin 78-81 (EMIO) | J15 header | LED0-LED3 output pins, see [Hardware](#hardware) table |
 
 The R5 barrier code dereferences `0x10000000` directly — DDR is a single
 physical resource shared by every master in the system (APU and RPU alike),
 so the same address is valid from all 4 cores despite R5's own code and stack
-living in TCM rather than DDR.
+living in TCM rather than DDR. Both R5 domains' linker scripts also declare an
+identical `psu_r5_ddr_0_memory_0` DDR window (`ORIGIN = 0x100000`), but neither
+app places any section there — TCM holds everything.
 
 ## Tools
 
@@ -191,6 +194,15 @@ already `1` from a previous run gives every core a false "go" signal before
 its peers have even reached the barrier. Using a strictly-increasing
 generation counter instead means each boot/reset cycle has its own unique
 target value, so there is no stale state to accidentally satisfy the barrier.
+
+### Offset DDR regions for the two A53 cores
+
+A53-0 and A53-1 both run out of DDR, and — unlike the two R5 cores, which each
+get a physically separate TCM — DDR is one shared resource. A53-1's linker
+script moves its whole `psu_ddr_0_memory_0` region to `ORIGIN = 0x20000000`
+instead of the default `0x0`, so its code, data, and stack can't land on top
+of A53-0's. This is the same technique this repo's original ping-pong project
+used to keep its two cores' ELFs apart in DDR, just with different offsets.
 
 ### Root cause of the JTAG dependency (and the fix)
 
